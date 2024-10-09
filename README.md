@@ -1,5 +1,5 @@
 # Full-Fine-Tuning-LLM
 
-```sh
+```bash
 python train.py config.json
 ```
