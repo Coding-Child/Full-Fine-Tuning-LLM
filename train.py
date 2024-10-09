@@ -1,13 +1,14 @@
 import logging
 import os
-import json
 import sys
+import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
 import evaluate
 import torch
+import numpy as np
 from datasets import load_dataset
 from bert_score import score
 
@@ -20,13 +21,13 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
-    GenerationConfig,
     set_seed,
     EvalPrediction,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
+from trl import DataCollatorForCompletionOnlyLM
 
 os.environ['TOKENIZERS_PARALLELISM'] = "false"
 os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
@@ -191,7 +192,6 @@ class DataTrainingArguments:
                 extension = self.validation_file.split(".")[-1]
                 assert extension in ["csv", "json", "txt", "jsonl"], "`validation_file` should be a csv, json, or txt file."
 
-
 def preprocess_function(examples, tokenizer):
     """_summary_
 
@@ -207,7 +207,7 @@ def preprocess_function(examples, tokenizer):
     inputs = examples['input']
     outputs = examples['output']
 
-    qa_texts = [f'{system_messgage} \nQuestion: {inp} \nAnswer: {out}' for inp, out in zip(inputs, outputs)]
+    qa_texts = [f'{system_messgage} \nQuestion: {inp} \nAnswer: <|pred|> {out}' for inp, out in zip(inputs, outputs)]
 
     tokenized_examples = tokenizer(qa_texts, truncation=True, padding='max_length', max_length=4096)
 
@@ -215,8 +215,20 @@ def preprocess_function(examples, tokenizer):
 
 
 def compute_metrics(p: EvalPrediction, tokenizer):
+    """_summary_
+
+    Args:
+        p (EvalPrediction): model predictions
+        tokenizer : tokenizer object
+
+    Returns:
+        dict: metrics
+    """
     predictions = p.predictions[0]
     labels = p.label_ids
+
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
 
     pred_str = tokenizer.batch_decode(predictions, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(labels, skip_special_tokens=True)
@@ -247,19 +259,9 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        with open(os.path.abspath(sys.argv[1]), "r") as f:
-            config_data = json.load(f)
-
-        generation_config_dict = config_data.pop("generation_config", None)
-        model_args, data_args, training_args = parser.parse_dict(config_data)
-
-        if generation_config_dict:
-            gen_config = GenerationConfig(**generation_config_dict)
-        else:
-            gen_config = None
+        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        gen_config = None
 
     send_example_telemetry('run_clm', model_args, data_args)
 
@@ -292,17 +294,17 @@ def main():
         use_fast=model_args.use_fast_tokenizer,
     )
 
+    num_added_toks = tokenizer.add_tokens(['<|pred|>'])
+    logger.info(f"Added {num_added_toks} tokens to the tokenizer.")
+
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         torch_dtype=getattr(torch, model_args.torch_dtype) if model_args.torch_dtype is not None else None,
-        low_cpu_mem_usage=model_args.low_cpu_mem_usage,
-        device_map='auto'
+        device_map='auto',
+        low_cpu_mem_usage=model_args.low_cpu_mem_usage
     )
-
-    if gen_config is not None:
-        model.genetation_config = gen_config
 
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
@@ -316,13 +318,14 @@ def main():
             batched=True,
             remove_columns=raw_datasets["train"].column_names,
             num_proc=data_args.preprocessing_num_workers,
-            load_from_cache_file=not data_args.overwrite_cache
+            load_from_cache_file=data_args.overwrite_cache
         )
     else:
         raise ValueError("Dataset does not have the correct columns.")
     
-    data_collator = DataCollatorForLanguageModeling(
+    data_collator = DataCollatorForCompletionOnlyLM(
         tokenizer=tokenizer,
+        response_template='<|pred|>',
         mlm=False
     )
 
